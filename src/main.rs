@@ -163,6 +163,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // uncompressed.write_to(&mut file, image::ImageFormat::Png)?;
     }
 
+    let mut file = File::create(format!("out/{}.bin", idx))?;
+    file.write_all(&v)?;
+
     // s.push_str("\n};\n");
     // s_num.push_str("};\n");
 
