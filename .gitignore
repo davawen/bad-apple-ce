@@ -4,5 +4,7 @@
 /images
 /program/bin
 /program/obj
+/player/bin
+/player/obj
 
 bad_apple.mp4
