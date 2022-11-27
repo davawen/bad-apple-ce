@@ -13,7 +13,7 @@
 #include <graphx.h>
 #include <fileioc.h>
 #include <sys/timers.h>
-#include <ti/getcsc.h>
+#include <keypadc.h>
 
 #include <math.h>
 #include <stdio.h>
@@ -42,6 +42,9 @@ int main(void)
     uint16_t idx = 0;
 	uint16_t end = 0;
 
+	// scale timer to not lose precision
+	uint32_t target_timer = timer_Get(1)*10 + 32768; // wait 100 ms (= 10 FPS)
+
     for(;;) {
 		if(idx >= end) {
 			char buf[5];
@@ -56,8 +59,7 @@ int main(void)
 			idx = 0;
 			end = ti_GetSize(handle);
 		}
-
-        uint32_t target_timer = timer_Get(1) + 3277; // wait 100 ms (= 10 FPS)
+		target_timer += 32768; // increment timer relative to the start
 
         uint24_t x = 0;
         uint8_t y = 0;
@@ -100,18 +102,20 @@ int main(void)
 
         gfx_SwapDraw();
 
-		while(timer_Get(1) < target_timer) {}
+		while(timer_Get(1)*10 < target_timer) {
+			// check for pressed key
+			if(kb_AnyKey()) {
+				goto end;
+			}
+		}
     }
-	
-	gfx_SetColor(0);
-
-    /* Wait for a key press */
-    while (!os_GetCSC());
 
 end:
+	if(handle != 0) ti_Close(handle);
 
+	gfx_SetColor(0);
     gfx_End();
-    // timer_Disable(1);
+    timer_Disable(1);
 
     return 0;
 }
