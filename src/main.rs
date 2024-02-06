@@ -1,17 +1,16 @@
-use byteorder::WriteBytesExt;
-use image::{io::Reader as ImageReader, GenericImage, GenericImageView};
-use std::{fs::{File, self}, io::Write, str::FromStr, path::Path};
+use image::{io::Reader as ImageReader, GenericImage, GenericImageView, DynamicImage};
+use itertools::Itertools;
+use std::{fs::{File, self}, io::Write};
 
-fn compress(path: &std::path::Path) -> image::ImageResult<Vec<u8>> {
-    let img = ImageReader::open(path)?.decode()?;
+const THRESHOLD: u8 = 60;
 
-    /*
-    | Marking Bit | Count - 6 bits | Value bit |
-    OR
-    | Marking bit | Count - 14 bits | Value bit |
-    */
+fn rle<I: Iterator<Item = bool>>(generator: I) -> Vec<u8> {
+    let mut out = Vec::new();
 
-    let load_into = |out: &mut Vec<u8>, value: bool, count: u16| {
+    let mut load = |value: bool, count: u16| {
+        // | Marking Bit = 0 | Count - 6 bits | Value bit |
+        // | Marking bit = 1 | Count - 14 bits | Value bit |
+
         // If count fits in 6 bits
         if count <= (u8::MAX >> 2).into() {
             // ( Marking bit is false)
@@ -23,43 +22,52 @@ fn compress(path: &std::path::Path) -> image::ImageResult<Vec<u8>> {
         }
     };
 
-    let mut out = Vec::new();
-
-    let mut value: bool = false;
+    let mut current = false;
     let mut count: u16 = 0;
-
-    for x in 0..img.width() {
-        for y in 0..img.height() {
-            let p = img.get_pixel(x, y).0[0];
-            if count == 0 {
-                value = p > 60;
-                count += 1;
+    
+    for item in generator {
+        if count == 0 {
+            current = item;
+            count += 1;
+        } else if item == current {
+            count += 1;
+            if count == (u16::MAX >> 2) {
+                load(current, count);
+                count = 0;
             }
-            else {
-                let current_value = p > 60;
+        } else {
+            load(current, count);
 
-                if value == current_value {
-                    count += 1;
-                    if count == (u16::MAX >> 2) {
-                        load_into(&mut out, value, count);
-                        count = 0;
-                    }
-                }
-                else {
-                    load_into(&mut out, value, count);
-
-                    value = current_value;
-                    count = 1;
-                }
-            }
+            current = item;
+            count = 1;
         }
     }
 
     if count != 0 {
-        load_into(&mut out, value, count);
+        load(current, count);
     }
 
-    Ok(out)
+    out
+}
+
+fn pixels_column_row(image: &DynamicImage) -> Vec<bool> {
+    (0..image.width())
+        .cartesian_product(0..image.height())
+        .map(|(x, y)| image.get_pixel(x, y))
+        .map(|p| p.0[0] > THRESHOLD)
+        .collect()
+}
+
+fn compress(image: &[bool], _: &[bool]) -> Vec<u8> {
+    rle(image.iter().copied())
+}
+
+fn compress_delta(current: &[bool], next: &[bool]) -> Vec<u8> {
+    // 0 -> stay the same, 1 -> flip bit
+    let deltas = current.iter().zip(next.iter())
+        .map(|(v1, v2)| v1 != v2);
+
+    rle(deltas)
 }
 
 fn decompress(compressed: &[u8]) -> image::ImageResult<image::DynamicImage> {
@@ -75,12 +83,12 @@ fn decompress(compressed: &[u8]) -> image::ImageResult<image::DynamicImage> {
     while let Some(&p) = it.next() {
         let (value, count): (u8, u16) = if (p & 0b1000_0000) > 0 { // if you've got the marking bit, you need to consoom the next package too
             let p2 = *it.next().unwrap();
-            let value = ( p2 & 0x1 ) as u8 * 255;
+            let value = ( p2 & 0x1 ) * 255;
             let count = ((p as u16 & 0b0111_1111) << 7) | ((p2 as u16) >> 1);
             (value, count)
         }
         else {
-            let value = ( p & 0x1 ) as u8 * 255;
+            let value = ( p & 0x1 ) * 255;
             let count = ( p & (!0x1) ) >> 1;
             (value, count.into())
         };
@@ -99,25 +107,7 @@ fn decompress(compressed: &[u8]) -> image::ImageResult<image::DynamicImage> {
     Ok(img)
 }
 
-fn byte_array_to_c(compressed: &[u8]) -> String {
-    let mut s = "\n".to_string();
-
-    let mut idx = 0;
-    for &b in compressed {
-        s.push_str(format!("{:#04x},", b).as_str());
-
-        idx += 1;
-        if idx == 16 {
-            s.push('\n');
-            idx = 0;
-        }
-    }
-    s.push('\n');
-
-    s
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn apply(algorithm: impl Fn(&[bool], &[bool]) -> Vec<u8>) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut paths = Vec::new();
 
     for path in fs::read_dir("./images")? {
@@ -126,53 +116,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         paths.push(path)
     }
 
-    paths.sort_by(|a, b| {
-        let numa = a.file_name().into_string().unwrap().chars().filter(|x| x.is_numeric()).collect::<String>().parse::<u32>().unwrap();
-        let numb = b.file_name().into_string().unwrap().chars().filter(|x| x.is_numeric()).collect::<String>().parse::<u32>().unwrap();
-        numa.cmp(&numb)
+    paths.sort_by_key(|x| {
+        x.file_name()
     });
 
-    // let mut s = "const uint8_t frames[] = {".to_string();
-    // let mut s_num = "const uint24_t FRAME_NUMS[] = {".to_string();
+    let mut images = paths.into_iter()
+        .map(|p| p.path())
+        .map(|p| ImageReader::open(p).unwrap().decode().unwrap())
+        .peekable();
 
-    let mut v = Vec::with_capacity(65000);
-    let mut idx = 0;
-    for path in paths {
-        println!("{:?}", path);
+    let mut v = Vec::new();
+    while let Some(image) = images.next() {
+        let Some(next) = images.peek() else { break };
 
-        let mut compressed = compress(&path.path())?;
+        let image = pixels_column_row(&image);
+        let next = pixels_column_row(next);
 
-        if v.len() + compressed.len() < 65000 {
+        let mut compressed = algorithm(&image, &next);
+
+        // let decompressed = decompress(&compressed).unwrap();
+        // let mut f = File::create(format!("images_out/{image_idx:04}.png")).unwrap();
+        // decompressed.write_to(&mut f, image::ImageFormat::Png).unwrap();
+        // drop(f);
+
             v.append(&mut compressed);
-        }
-        else {
-            let mut file = File::create(format!("out/{}.bin", idx))?;
-            file.write_all(&v)?;
-
-            v.clear();
-            v.append(&mut compressed);
-
-            idx += 1;
-        }
-
-        // s.push_str(byte_array_to_c(&compressed).as_str());
-        // s_num.push_str(format!("{}, ", compressed.len()).as_str());
-
-        // let mut file = File::create(format!("outi/{}", path.file_name().to_str().unwrap()))?;
-        // let uncompressed = decompress(&compressed)?;
-        // uncompressed.write_to(&mut file, image::ImageFormat::Png)?;
     }
 
-    let mut file = File::create(format!("out/{}.bin", idx))?;
-    file.write_all(&v)?;
 
-    // s.push_str("\n};\n");
-    // s_num.push_str("};\n");
+    Ok(v)
+}
 
-    // let mut file = File::create("out_text.h")?;
-    // file.write_all(b"const uint24_t FRAME_NUM = 100;\n")?;
-    // file.write_all(s_num.as_bytes())?;
-    // file.write_all(s.as_bytes())?;
+fn write(compressed: Vec<u8>) {
+    for entry in fs::read_dir("out").unwrap() {
+        let Ok(entry) = entry else { continue };
+        fs::remove_file(entry.path()).unwrap();
+    }
+
+    let mut idx = 0;
+    while idx*65000 < compressed.len() {
+        let name = format!("out/{idx:02}.bin");
+        eprintln!("creating {name}");
+        let mut file = File::create(name).unwrap();
+        file.write_all(&compressed[idx*65000..((idx+1)*65000).min(compressed.len())]).unwrap();
+
+        idx += 1;
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let normal = apply(compress)?;
+    let delta = apply(compress_delta)?;
+
+    println!("Normal compression: {} bytes", normal.len());
+    println!("Delta compression: {} bytes", delta.len());
+
+    write(delta);
 
     Ok(())
 }
